@@ -34,8 +34,8 @@ from telegram.ext import (
 # 4) Install: pip install -U python-telegram-bot
 # ============================================================
 
-BOT_TOKEN = "8368224966:AAHEr5J1uQIA2_D-46RtgUVnPQ61ldN7HqM"
-DB_NAME = "blackberry_bot.db"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+DB_NAME = os.environ.get("DB_NAME", "/tmp/blackberry_bot.db")
 
 SPAM_LIMIT = 6
 SPAM_WINDOW = 10

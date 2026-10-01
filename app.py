@@ -6,11 +6,10 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# Vercel's filesystem is ephemeral. Use /tmp for the SQLite file so the
-# existing Blackberry bot code can initialize and write during an invocation.
 ROOT = Path(__file__).resolve().parent
 seed_db = ROOT / "blackberry_bot.db"
 runtime_db = Path("/tmp/blackberry_bot.db")
+runtime_db.parent.mkdir(parents=True, exist_ok=True)
 if seed_db.exists() and not runtime_db.exists():
     shutil.copy2(seed_db, runtime_db)
 
@@ -74,8 +73,6 @@ async def lifespan(app: FastAPI):
     if not _initialized:
         await tg_app.initialize()
         _initialized = True
-
-        # Set Telegram webhook automatically after the Vercel deployment.
         vercel_url = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or os.environ.get("VERCEL_URL")
         if vercel_url:
             if not vercel_url.startswith("http"):
@@ -92,7 +89,6 @@ async def health():
 
 @app.post("/api/webhook")
 async def telegram_webhook(request: Request):
-    # Telegram sends JSON updates to this endpoint.
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
     if update is not None:
