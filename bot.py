@@ -4,6 +4,12 @@ import re
 import asyncio
 import os
 import json
+import tempfile
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 from telegram import ChatPermissions
 from collections import defaultdict
@@ -44,6 +50,9 @@ HISTORY_LIMIT_DEFAULT = 20
 MAX_HISTORY_SAVE = 5000
 MAX_TAGS = 50
 TRANSLATE_TIMEOUT = 15
+BOT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Kolkata")
+NSFW_SCAN_ENABLED = os.environ.get("NSFW_SCAN_ENABLED", "1") == "1"
+NSFW_SCAN_MAX_FRAMES = 8
 
 LINK_RE = re.compile(
     r"(?:https?://|www\.|t\.me/|telegram\.me/|@[A-Za-z0-9_]{5,})",
@@ -214,6 +223,15 @@ def commit():
     db.commit()
 
 
+def current_clock():
+    try:
+        tz = ZoneInfo(BOT_TIMEZONE) if ZoneInfo else None
+        now = datetime.now(tz) if tz else datetime.now()
+        return now.strftime("%d-%m-%Y %I:%M:%S %p")
+    except Exception:
+        return datetime.now().strftime("%d-%m-%Y %I:%M:%S %p")
+
+
 def log_action(chat_id, actor_id, action, target_id=None, target_name=None):
     cursor.execute(
         """INSERT INTO admin_logs
@@ -267,7 +285,7 @@ def target(update: Update):
 
 
 def resolve_user_identifier(update, args=None):
-    """Resolve reply target, numeric ID, or tracked @username."""
+    """Resolve reply target, numeric ID, @username, or tracked username."""
     args = args or []
     u = target(update)
     if u:
@@ -277,20 +295,36 @@ def resolve_user_identifier(update, args=None):
     raw = args[0].strip()
     if raw.startswith("@"):
         raw = raw[1:]
-    try:
+
+    if raw.lstrip("-").isdigit():
         uid = int(raw)
-        cursor.execute("SELECT user_id,username,full_name FROM tracked_members WHERE chat_id=? AND user_id=?", (update.effective_chat.id, uid))
+        cursor.execute(
+            "SELECT user_id,username,full_name FROM tracked_members "
+            "WHERE chat_id=? AND user_id=?",
+            (update.effective_chat.id, uid),
+        )
         row = cursor.fetchone()
-        return SimpleNamespace(id=uid, username=row[1] if row else None, full_name=row[2] if row else str(uid), is_bot=False)
-    except ValueError:
-        pass
+        return SimpleNamespace(
+            id=uid,
+            username=row[1] if row else None,
+            full_name=row[2] if row else str(uid),
+            is_bot=False,
+        )
+
     cursor.execute(
-        "SELECT user_id,username,full_name FROM tracked_members WHERE chat_id=? AND lower(username)=lower(?) ORDER BY last_seen DESC LIMIT 1",
+        "SELECT user_id,username,full_name FROM tracked_members "
+        "WHERE chat_id=? AND lower(username)=lower(?) "
+        "ORDER BY last_seen DESC LIMIT 1",
         (update.effective_chat.id, raw),
     )
     row = cursor.fetchone()
     if row:
-        return SimpleNamespace(id=row[0], username=row[1], full_name=row[2] or raw, is_bot=False)
+        return SimpleNamespace(
+            id=row[0],
+            username=row[1],
+            full_name=row[2] or raw,
+            is_bot=False,
+        )
     return None
 
 
@@ -546,6 +580,119 @@ def media_looks_adult(message):
     return False
 
 
+def _nsfw_labels_are_adult(result):
+    """Conservative NudeNet result check. No visual detector can guarantee 99%."""
+    if not isinstance(result, list):
+        return False
+    high_risk = {
+        "FEMALE_GENITALIA_EXPOSED",
+        "MALE_GENITALIA_EXPOSED",
+        "ANUS_EXPOSED",
+        "BUTTOCKS_EXPOSED",
+        "FEMALE_BREAST_EXPOSED",
+    }
+    for item in result:
+        label = str(item.get("class", "")).upper()
+        score = float(item.get("score", 0) or 0)
+        if label in high_risk and score >= 0.55:
+            return True
+    return False
+
+
+async def visual_media_looks_adult(message, context):
+    """Optional visual scan using NudeNet for photos/stickers and sampled video frames."""
+    if not NSFW_SCAN_ENABLED:
+        return False
+
+    try:
+        from nudenet import NudeDetector
+    except Exception:
+        return False
+
+    media = None
+    suffix = ".bin"
+    if message.photo:
+        media, suffix = message.photo[-1], ".jpg"
+    elif message.sticker:
+        media, suffix = message.sticker, ".webp"
+    elif message.animation:
+        media, suffix = message.animation, ".mp4"
+    elif message.video:
+        media, suffix = message.video, ".mp4"
+    elif message.document:
+        mime = (message.document.mime_type or "").lower()
+        if mime.startswith("image/"):
+            media, suffix = message.document, ".jpg"
+        elif mime.startswith("video/"):
+            media, suffix = message.document, ".mp4"
+
+    if not media:
+        return False
+
+    detector = NudeDetector()
+    tmp_path = None
+    try:
+        tg_file = await media.get_file()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+
+        # Direct image/sticker scan.
+        if suffix in (".jpg", ".webp"):
+            return _nsfw_labels_are_adult(detector.detect(tmp_path))
+
+        # Sample video/animation frames when OpenCV is available.
+        try:
+            import cv2
+        except Exception:
+            return False
+
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            return False
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            cap.release()
+            return False
+
+        import tempfile as _tf
+        sample_count = min(NSFW_SCAN_MAX_FRAMES, total)
+        positions = [int(i * max(total - 1, 1) / max(sample_count - 1, 1))
+                     for i in range(sample_count)]
+
+        for pos in positions:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            ok, encoded = cv2.imencode(".jpg", frame)
+            if not ok:
+                continue
+            with _tf.NamedTemporaryFile(delete=False, suffix=".jpg") as frame_file:
+                frame_path = frame_file.name
+                frame_file.write(encoded.tobytes())
+            try:
+                if _nsfw_labels_are_adult(detector.detect(frame_path)):
+                    return True
+            finally:
+                try:
+                    os.unlink(frame_path)
+                except OSError:
+                    pass
+
+        cap.release()
+        return False
+    except Exception as e:
+        print("VISUAL NSFW SCAN ERROR:", repr(e))
+        return False
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 async def notify_admins(chat, text):
     try:
         admins = await chat.get_administrators()
@@ -772,13 +919,34 @@ async def block_command(update, context):
 
 
 async def unblock_command(update, context):
-    if not await admin_required(update): return
-    u=target(update); uid=u.id if u else (int(context.args[0]) if context.args and context.args[0].isdigit() else None)
-    if uid is None: return await update.message.reply_text("Usage: reply /unblock or /unblock USER_ID")
-    cursor.execute("DELETE FROM blocked_users WHERE chat_id=? AND user_id=?",(update.effective_chat.id,uid)); commit()
-    try: await update.effective_chat.unban_member(uid, only_if_banned=True)
-    except Exception: pass
-    await update.message.reply_text(f"✅ Removed from blocklist: {uid}")
+    if not await admin_required(update):
+        return
+    u = resolve_user_identifier(update, context.args)
+    if not u:
+        return await update.message.reply_text(
+            "Usage: reply to a member + /unblock\n"
+            "OR /unblock USER_ID\nOR /unblock @username"
+        )
+    uid = u.id
+    cursor.execute(
+        "DELETE FROM blocked_users WHERE chat_id=? AND user_id=?",
+        (update.effective_chat.id, uid),
+    )
+    commit()
+    try:
+        await update.effective_chat.unban_member(uid, only_if_banned=True)
+    except Exception:
+        pass
+    log_action(update.effective_chat.id, update.effective_user.id, "unblock", uid, u.full_name)
+    await update.message.reply_text(
+        f"🕊️ Freed / unblocked\n👤 {escape(u.full_name)}\n🆔 <code>{uid}</code>",
+        parse_mode="HTML",
+    )
+
+
+async def free_command(update, context):
+    """Free/unblock a member by reply, ID, or username."""
+    await unblock_command(update, context)
 
 
 async def blocklist_command(update, context):
@@ -789,62 +957,84 @@ async def blocklist_command(update, context):
     await update.message.reply_text("🚫 <b>Blocklist</b>\n\n"+"\n".join(f"• {escape(n)} — <code>{u}</code>" for u,n in rows)[:3900],parse_mode="HTML")
 
 
-async def tagall_command(update, context):
-    if not await admin_required(update):
-        return
-    cid = update.effective_chat.id
-    cursor.execute(
-        "SELECT user_id,full_name FROM tracked_members WHERE chat_id=? ORDER BY last_seen DESC LIMIT ?",
-        (cid, MAX_TAGS),
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        return await update.message.reply_text(
-            "📭 No tracked members yet. Members must send a message or join while the bot is active."
-        )
+def resolve_action_target(update, args=None):
+    """Resolve a moderation target, including replying to the bot's join-request card."""
+    args = args or []
+    if args:
+        return resolve_user_identifier(update, args)
 
-    # Telegram message text has a length limit, so split mentions safely.
-    chunks, current = [], "📢 "
-    for uid, name in rows:
-        mention = f'<a href="tg://user?id={uid}">{escape(name or str(uid))}</a>'
-        if len(current) + len(mention) + 1 > 3500:
-            chunks.append(current)
-            current = "📢 " + mention
-        else:
-            current += (" " if current != "📢 " else "") + mention
-    if current.strip() != "📢":
-        chunks.append(current)
+    reply = update.message.reply_to_message if update.message else None
+    if not reply:
+        return None
 
-    for chunk in chunks:
-        await update.message.reply_text(
-            chunk, parse_mode="HTML", disable_web_page_preview=True
-        )
+    # Normal reply to a member's message.
+    if reply.from_user and not reply.from_user.is_bot:
+        return reply.from_user
+
+    # Reply to bot-generated join-request notification: extract numeric ID.
+    raw = reply.text or reply.caption or ""
+    match = re.search(r"(?:ID|id)\s*[:—-]?\s*<code>(-?\d+)</code>", raw)
+    if not match:
+        match = re.search(r"(?:ID|id)\s*[:—-]?\s*(-?\d+)", raw)
+    if match:
+        return resolve_user_identifier(update, [match.group(1)])
+    return None
 
 
 async def approve_command(update, context):
-    if not await admin_required(update): return
-    uid=None
-    if context.args and context.args[0].lstrip('-').isdigit(): uid=int(context.args[0])
-    elif update.message.reply_to_message: uid=update.message.reply_to_message.from_user.id
-    if uid is None: return await update.message.reply_text("Usage: /approve USER_ID")
+    if not await admin_required(update):
+        return
+    u = resolve_action_target(update, context.args)
+    if not u:
+        return await update.message.reply_text(
+            "Usage: reply to the join-request message + /approve\n"
+            "OR /approve USER_ID\nOR /approve @username"
+        )
+    uid = u.id
     try:
         await update.effective_chat.approve_chat_join_request(uid)
-        cursor.execute("DELETE FROM join_requests WHERE chat_id=? AND user_id=?",(update.effective_chat.id,uid)); commit()
-        log_action(update.effective_chat.id,update.effective_user.id,"approve",uid)
-        await update.message.reply_text(f"✅ Approved <code>{uid}</code>.",parse_mode="HTML")
-    except Exception as e: await update.message.reply_text(f"❌ Approval failed: {e}")
+        cursor.execute(
+            "DELETE FROM join_requests WHERE chat_id=? AND user_id=?",
+            (update.effective_chat.id, uid),
+        )
+        commit()
+        log_action(update.effective_chat.id, update.effective_user.id, "approve", uid, u.full_name)
+        await update.message.reply_text(
+            f"✅ Approved\n👤 {escape(u.full_name)}\n🆔 <code>{uid}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Approval failed: {escape(str(e))}")
 
 
 async def decline_command(update, context):
-    if not await admin_required(update): return
-    if not context.args or not context.args[0].lstrip('-').isdigit(): return await update.message.reply_text("Usage: /decline USER_ID")
-    uid=int(context.args[0])
+    if not await admin_required(update):
+        return
+    u = resolve_action_target(update, context.args)
+    if not u:
+        return await update.message.reply_text(
+            "Usage: reply to the join-request message + /decline\n"
+            "OR /decline USER_ID\nOR /decline @username"
+        )
+    uid = u.id
     try:
         await update.effective_chat.decline_chat_join_request(uid)
-        cursor.execute("DELETE FROM join_requests WHERE chat_id=? AND user_id=?",(update.effective_chat.id,uid)); commit()
-        log_action(update.effective_chat.id,update.effective_user.id,"decline",uid)
-        await update.message.reply_text(f"✅ Declined <code>{uid}</code>.",parse_mode="HTML")
-    except Exception as e: await update.message.reply_text(f"❌ Decline failed: {e}")
+        cursor.execute(
+            "DELETE FROM join_requests WHERE chat_id=? AND user_id=?",
+            (update.effective_chat.id, uid),
+        )
+        commit()
+        log_action(update.effective_chat.id, update.effective_user.id, "decline", uid, u.full_name)
+        await update.message.reply_text(
+            f"❌ Declined / Unapproved\n👤 {escape(u.full_name)}\n🆔 <code>{uid}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Decline failed: {escape(str(e))}")
+
+
+async def unapprove_command(update, context):
+    await decline_command(update, context)
 
 
 async def join_request_handler(update, context):
@@ -903,14 +1093,14 @@ Reply to media + /filter hello — save photo/sticker/video/etc.
 /badword add WORD
 /badword remove WORD
 /lock /unlock
-/block USER_ID /unblock USER_ID /blocklist
+/block USER_ID /unblock USER_ID /free USER_ID /blocklist
 
 <b>🚨 ADMIN TOOLS</b>
 /report reason — reply to a member
 /adminlogs — moderation history
 /approve USER_ID — approve join request
 /decline USER_ID — decline join request
-/tagall — tag tracked members
+/unapprove USER_ID — decline/unapprove join request
 
 <b>👋 WELCOME</b>
 /setwelcome Welcome {mention} to {chat}!
@@ -930,9 +1120,9 @@ Reply to ANY message/word + /tr hi
 <b>📌 IMPORTANT SETUP</b>
 • Bot should be ADMIN for moderation, deleting, approvals and welcome events.
 • Disable BotFather Privacy Mode if you want the bot to read normal group messages.
-• History/ranking/tagall only contain users/messages the bot has observed.
+• History/ranking only contain users/messages the bot has observed.
 • Telegram does not give bots a complete old chat archive by user ID.
-• Visual nude-image detection needs a separate image-classification service; this bot removes obvious NSFW keywords/sticker-set labels."""
+• Visual NSFW scan uses optional NudeNet when installed; keyword/sticker-label checks remain as fallback. No visual detector guarantees 99%."""
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -1083,7 +1273,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                media_file_id, reply_to_message_id, created_at FROM user_history
         WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?""", (cid, u.id, limit))
     rows = cursor.fetchall()
-    lines = [f"👤 <b>User history</b>", f"🆔 ID: <code>{u.id}</code>", f"📛 Current name: {escape(current_name or '—')}", f"🔗 Current username: @{escape(current_username) if current_username else '—'}"]
+    lines = [f"👤 <b>User history</b>", f"🕒 Current time: <code>{current_clock()}</code>", f"🆔 ID: <code>{u.id}</code>", f"📛 Current name: {escape(current_name or '—')}", f"🔗 Current username: @{escape(current_username) if current_username else '—'}"]
     if identities:
         lines.append("🕘 <b>Names/usernames seen before:</b>")
         seen=set()
@@ -1904,7 +2094,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             return await update.message.reply_text("🏆 No ranking data yet.")
 
-        text = "🏆 <b>Top Chatters</b>\n\n"
+        text = f"🏆 <b>Top Chatters</b>\n🕒 Current time: <code>{current_clock()}</code>\n\n"
         for i, (name, uid, messages) in enumerate(rows, 1):
             text += f"{i}. {name} — {messages} messages\n"
         return await update.message.reply_text(text, parse_mode="HTML")
@@ -1916,7 +2106,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏆 <b>{escape(update.effective_user.full_name)}</b>\n"
         f"🆔 <code>{update.effective_user.id}</code>\n"
         f"📊 Rank: #{position}\n"
-        f"💬 Messages: {messages}", parse_mode="HTML")
+        f"💬 Messages: {messages}\n🕒 Current time: <code>{current_clock()}</code>", parse_mode="HTML")
 
 
 async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2004,13 +2194,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT adult_filter FROM mod_settings WHERE chat_id=?", (chat.id,))
     _adult_row = cursor.fetchone()
     adult_filter_on = bool(_adult_row[0]) if _adult_row else True
-    if adult_filter_on and media_looks_adult(message) and not await is_admin(update, user.id):
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        log_action(chat.id, 0, "adult_media_removed", user.id, user.full_name)
-        return
+    if adult_filter_on and not await is_admin(update, user.id):
+        adult_hit = media_looks_adult(message)
+        if not adult_hit and (message.photo or message.sticker or message.video or message.animation or message.document):
+            adult_hit = await visual_media_looks_adult(message, context)
+        if adult_hit:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            log_action(chat.id, 0, "adult_media_removed", user.id, user.full_name)
+            return
 
     # Always track observed messages first.
     save_history(message)
@@ -2215,10 +2409,11 @@ def main():
         ("report", report_command),
         ("approve", approve_command),
         ("decline", decline_command),
+        ("unapprove", unapprove_command),
         ("block", block_command),
         ("unblock", unblock_command),
+        ("free", free_command),
         ("blocklist", blocklist_command),
-        ("tagall", tagall_command),
         ("tr", translate_command),
         ("translate", translate_command),
 
