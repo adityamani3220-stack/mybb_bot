@@ -53,7 +53,7 @@ COMMANDS = [
     ("report", bot.report_command), ("approve", bot.approve_command),
     ("decline", bot.decline_command), ("block", bot.block_command),
     ("unblock", bot.unblock_command), ("blocklist", bot.blocklist_command),
-    ("tagall", bot.tagall_command), ("tr", bot.translate_command),
+    ("tr", bot.translate_command),
     ("translate", bot.translate_command),
 ]
 
