@@ -248,9 +248,18 @@ async def unapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 Blackberry Bot Active!")
 
+
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏓 Pong! Active.")
 
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Blackberry Bot Help\n\n"
+        "/start - Start bot\n"
+        "/help - Show help\n"
+        "/ping - Check bot status"
+    )
 
 # ------------------------- MESSAGE & SPAM ENGINE -------------------------
 
